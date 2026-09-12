@@ -298,18 +298,29 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
 
 def _skills_prompt(agent: Any) -> str:
     """Skills index (empty without skills tools).  Focus mode demotes non-coding
-    categories to names-only — never hidden, every name stays visible."""
+    categories to names-only; ``skills.compact_categories`` / ``skills.compact_skills``
+    extend that from config so a messaging surface can shrink the index too.  Nothing is
+    ever hidden — every name stays visible."""
     if not any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage']):
         return ""
     import model_tools
     avail_toolsets = {model_tools.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names} - {None, ""}
+    _cfg_cats: "frozenset[str]" = frozenset()
+    _cfg_skills: "frozenset[str]" = frozenset()
+    try:
+        _cfg_cats, _cfg_skills = _pb.get_compact_skill_config()
+    except Exception:
+        pass  # A bad config key must never break prompt assembly.
     try:
         from agent.coding_context import coding_compact_skill_categories
-        _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
+        _compact_cats = set(coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd()))
     except Exception:
-        _compact_cats = frozenset()
+        _compact_cats = set()
+    _compact_cats |= _cfg_cats
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=frozenset(_compact_cats) or None,
+                                         skills_dir_override=_agent_skills_dir(agent),
+                                         compact_skills=_cfg_skills or None)
 
 
 def _bot_mode_parts(agent: Any) -> List[str]:

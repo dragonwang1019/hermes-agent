@@ -347,6 +347,48 @@ class TestBuildSkillsSystemPrompt:
 
 
 
+    def test_count_only_category_hides_names_and_names_the_way_back(
+        self, monkeypatch, tmp_path
+    ):
+        """A ``category:*`` entry renders one count-only line: no names, but the count and the tool
+        that can recover them. The unstarred form keeps listing names (the star is the difference)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for name, desc in (("thread-writer", "Write threads"), ("post-scheduler", "Schedule posts")):
+            d = tmp_path / "skills" / "social-media" / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {desc}\n---\n")
+        out = build_skills_system_prompt(compact_categories=frozenset({"social-media:*"}))
+        assert "[count only]: 2 skills" in out
+        assert "thread-writer" not in out and "Write threads" not in out
+        # Recovery must be named on the line: skill_search, or skills_list when the session has no
+        # search tool.
+        assert "skill_search" in out or "skills_list(category=" in out
+        listed = build_skills_system_prompt(compact_categories=frozenset({"social-media"}))
+        assert "thread-writer" in listed and "Write threads" not in listed
+
+    @pytest.mark.parametrize("age_days,expected", [(0, True), (20, False)])
+    def test_count_only_line_carries_recent_hint_only_while_fresh(
+        self, monkeypatch, tmp_path, age_days, expected
+    ):
+        """The recently-used hint is the passive-recall insurance for a count-only line; a stale
+        file must render nothing rather than point at a working set that has moved on."""
+        import json
+        import time
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "social-media" / "thread-writer"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("---\nname: thread-writer\ndescription: Write threads\n---\n")
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "skill_recent.json").write_text(json.dumps({
+            "generated": time.time() - age_days * 86400,
+            "by_category": {"social-media": ["thread-writer"]},
+        }))
+        out = build_skills_system_prompt(compact_categories=frozenset({"social-media:*"}))
+        assert ("recently used: thread-writer" in out) is expected
+        assert "[count only]" in out          # the line itself is always there
+
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

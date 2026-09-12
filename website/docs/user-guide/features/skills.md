@@ -158,6 +158,28 @@ Level 2: skill_view(name, path)  → Specific reference file       (varies)
 
 The agent only loads the full skill content when it actually needs it.
 
+### Keeping the index small
+
+Every session pays for the skills index in its system prompt, so a large catalog is worth shaping.
+Two optional demotions in `config.yaml` (under `skills:`) shrink it without hiding anything —
+every name stays visible, and every skill stays loadable with `skill_view`:
+
+| Setting | Effect |
+|---------|--------|
+| `skills.compact_categories` | Collapses a whole category onto one line that still lists its names. Append `:` + `*` (e.g. `library:*`) to keep only the count: `library [count only]: 79 skills`. |
+| `skills.compact_skills` | Drops the description of the named entries, in place — the name stays listed. |
+
+A count-only line tells the agent how to get the names back. That is `skill_search`, plus a
+"recently used" hint when recent usage is known (built from the last 30 days of real `skill_view`
+calls by `scripts/skill_recent_hint.py`).
+
+`skill_search` finds skills by topic with **local** embeddings (any Ollama embedding model, default
+`bge-m3:latest`; override with `HERMES_SKILL_SEARCH_MODEL` / `HERMES_SKILL_SEARCH_URL`). One lookup
+returns ~1 KB instead of the whole catalog and costs no API tokens. The vectors are cached under
+`~/.hermes/cache/skill_search_index.npz` and rebuilt automatically when the catalog changes
+(`scripts/skill_search_warmup.py` does it ahead of time). When no embedder is reachable it degrades
+to lexical search rather than failing, so the index is never a dead end.
+
 ## SKILL.md Format
 
 ```markdown

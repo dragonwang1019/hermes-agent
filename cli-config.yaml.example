@@ -1058,6 +1058,22 @@ skills:
   #   - ~/.agents/skills
   #   - /home/shared/team-skills
 
+  # Shrink the always-on skills index — every session pays for it, so a large catalog is
+  # worth shaping.  Both demotions are opt-in and name-preserving: nothing is ever hidden,
+  # and every skill stays loadable with skill_view.
+  #
+  #   compact_categories — collapse a whole category onto one line that still lists its names.
+  #     Append ":" + "*" (e.g. "library:*") to keep only the count:
+  #     "library [count only]: 79 skills".  Such a line names skill_search as the way back,
+  #     plus a "recently used" hint when recent usage is known.
+  #   compact_skills — the named entries keep their name but lose the description, in place.
+  #
+  # compact_categories:
+  #   - library:*
+  #   - mlops
+  # compact_skills:
+  #   - some-large-skill
+
 # =============================================================================
 # Agent Behavior
 # =============================================================================

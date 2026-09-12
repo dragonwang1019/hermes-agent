@@ -969,3 +969,58 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
+
+
+class TestSkillSearch:
+    """`skill_search` is the way back to names for a count-only index line, so it has to answer
+    with no embedder at all — an unreachable Ollama must degrade to lexical search, never fail."""
+
+    @pytest.fixture
+    def searchable(self, tmp_path, monkeypatch):
+        """A hermetic catalog: `_find_all_skills` also walks bundled/external dirs, so the
+        discovery layer is stubbed out and only what this feature decides is under test."""
+        catalog = [
+            {"name": "stop-loss-sop", "category": "trading",
+             "description": "Exit rules for a losing position."},
+            {"name": "axolotl", "category": "mlops/inference",
+             "description": "Fine-tune models locally."},
+            {"name": "thread-writer", "category": "social", "description": "Draft social threads."},
+        ]
+        monkeypatch.setattr(skills_tool_module, "_skill_search_catalog", lambda: list(catalog))
+        monkeypatch.setattr(skills_tool_module, "_skill_search_index_file",
+                            lambda: tmp_path / "skill_search_index.npz")
+        monkeypatch.setattr(skills_tool_module, "_SKILL_SEARCH_CACHE", {})
+        # Nothing listens on port 1 — the embed pass must fail fast and fall back.
+        monkeypatch.setattr(skills_tool_module, "_SKILL_SEARCH_DEFAULT_URL", "http://127.0.0.1:1")
+        return catalog
+
+    def test_answers_from_lexical_fallback_without_an_embedder(self, searchable):
+        """Char-bigram overlap is crude by design — it only has to put the right skill first."""
+        result = json.loads(skills_tool_module.skill_search("stop loss", k=3))
+        assert "lexical" in result["retriever"]
+        assert result["total_skills"] == 3
+        assert result["results"][0]["name"] == "stop-loss-sop"
+        assert result["results"][0]["score"] == max(r["score"] for r in result["results"])
+
+    def test_unrelated_skills_are_not_returned_as_zero_score_matches(self, searchable):
+        """A skill with no query overlap is not a weak match — it must not pad the results."""
+        result = json.loads(skills_tool_module.skill_search("stop loss", k=5))
+        assert all(r["score"] > 0 for r in result["results"])
+
+    def test_category_filter_matches_nested_subcategory(self, searchable):
+        result = json.loads(skills_tool_module.skill_search("fine-tune", category="mlops"))
+        assert [r["name"] for r in result["results"]] == ["axolotl"]
+        assert result["total_skills"] == 1        # filtered before ranking, not after
+
+    def test_category_filter_excludes_other_categories(self, searchable):
+        result = json.loads(skills_tool_module.skill_search("stop loss", category="social"))
+        assert "stop-loss-sop" not in [r["name"] for r in result["results"]]
+
+    def test_empty_query_is_an_error_not_a_crash(self, searchable):
+        result = json.loads(skills_tool_module.skill_search("   "))
+        assert "error" in result
+
+    def test_k_is_clamped_to_a_sane_ceiling(self, searchable):
+        result = json.loads(skills_tool_module.skill_search("skill", k=999))
+        assert len(result["results"]) <= 12
+

@@ -11,6 +11,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -1007,7 +1008,11 @@ def _embedder_environment_hint() -> str:
 def get_compact_skill_config() -> "tuple[frozenset[str], frozenset[str]]":
     """``(compact_categories, compact_skills)`` from config.yaml, both empty by default.
 
-    ``skills.compact_categories`` demotes whole categories to one ``[names only]`` line;
+    ``skills.compact_categories`` demotes whole categories to one ``[names only]`` line; a trailing
+    ``*`` on an entry (``library:*``) makes that line COUNT-ONLY — the count and the way back instead
+    of the names, which is where the residual index bytes live once most categories are demoted.  In
+    that case config it alongside a working ``skill_search`` (local embeddings, no API cost) and the
+    recent-usage hint written by ``~/.hermes/scripts/skill_recent_hint.py``.
     ``skills.compact_skills`` drops the description of the named entries in place.  Listing a
     description of ~60 CJK characters costs ~3x its char count in UTF-8 bytes, so a large
     always-on index is dominated by descriptions of skills that are never loaded.  Names are
@@ -1024,6 +1029,47 @@ def get_compact_skill_config() -> "tuple[frozenset[str], frozenset[str]]":
         return frozenset(s for v in raw if (s := str(v).strip()))
 
     return _names("compact_categories"), _names("compact_skills")
+
+
+_SKILL_RECENT_CACHE: dict = {}
+# A hint older than this is worse than no hint: the working set has moved on.
+_RECENT_HINT_MAX_AGE_DAYS = 14.0
+
+
+def _compact_category_base(entry: str) -> str:
+    """Category name from a ``compact_categories`` entry: ``"library:*"`` -> ``"library"``.
+
+    The ``*`` marks the entry count-only; it is written after the colon (``library:*``) so the same
+    list stays readable in config.yaml without quoting surprises.
+    """
+    return str(entry).rstrip("*").rstrip(":").strip()
+
+
+def _recent_skill_hint(category: str, limit: int = 3) -> list:
+    """Recently loaded skill names for ``category``, from ``$HERMES_HOME/cache/skill_recent.json``.
+
+    A count-only index line shows no names, so the handful of entries that actually get used are
+    surfaced instead: passive recall for the working set at ~80 bytes a line instead of the whole
+    list.  Written by ``~/.hermes/scripts/skill_recent_hint.py``.  Anything wrong with the file —
+    missing, older than ``_RECENT_HINT_MAX_AGE_DAYS``, malformed — yields ``[]`` and the line simply
+    renders without the hint, so this can never break a prompt build.
+    """
+    try:
+        path = get_hermes_home() / "cache" / "skill_recent.json"
+        st = path.stat()
+        key = (str(path), st.st_mtime_ns, st.st_size)
+        data = _SKILL_RECENT_CACHE.get(key)
+        if data is None:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            _SKILL_RECENT_CACHE.clear()
+            _SKILL_RECENT_CACHE[key] = data
+        generated = float(data.get("generated") or 0.0)
+        if generated and (time.time() - generated) > _RECENT_HINT_MAX_AGE_DAYS * 86400:
+            return []
+        names = ((data.get("by_category") or {}).get(str(category)) or [])
+        return [str(n) for n in names if str(n).strip()][:limit]
+    except Exception:
+        return []
 
 
 def build_environment_hints() -> str:
@@ -1327,13 +1373,29 @@ def _render_skills_index(
         return ""
     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
     # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
-    demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
+    # A trailing "*" on a compact_categories entry ("library:*") makes that category COUNT-ONLY: the line keeps
+    # the entry count and the way back, not the names — which is where the residual index bytes live once every
+    # category is demoted. Retrieval is only acceptable here because the search tool is local and free; the
+    # measurement behind the split is ~/.hermes/cache/skill_retrieval_bench2.py.
+    _compact_cats = frozenset(str(c) for c in (compact_categories or ()))
+    _cc_bases = frozenset(_compact_category_base(c) for c in _compact_cats)
+    count_only = frozenset(_compact_category_base(c) for c in _compact_cats if c.endswith("*"))
+    demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in _cc_bases)
     name_only = compact_skills or frozenset()
+    # Count-only lines carry the only way back to the hidden names: name a tool that actually exists.
+    _search_tool = "skill_search" if (available_tools is None or "skill_search" in available_tools) else ""
+    _find_phrase = (f'find one with {_search_tool}("<topic>")' if _search_tool
+                    else "find one with skills_list(category=...)")
     hidden_note = (
         "\n(Categories marked [names only] are outside the current coding "
         "context, so their descriptions are omitted — the skills work "
         "normally and load with skill_view(name) as usual.)"
     ) if demoted else ""
+    if count_only:
+        hidden_note += (
+            "\n([count only] lines hide the names as well as the descriptions — nothing is removed: "
+            f"{_find_phrase}, then load the one you pick with skill_view(name).)"
+        )
     # Don't name web_search when the session has no web tools (dangling reference).
     _basic_tools = "terminal" if available_tools is not None and "web_search" not in available_tools else "web_search or terminal"
     index_lines = []
@@ -1341,7 +1403,14 @@ def _render_skills_index(
     for category in sorted(skills_by_category):
         entries = skills_by_category[category]
         if category in demoted:
-            index_lines.append(f"  {category} [names only]: {', '.join(sorted({n for n, _ in entries}))}")
+            if category.split("/", 1)[0] in count_only:
+                _names = {n for n, _ in entries}
+                line = f"  {category} [count only]: {len(_names)} skills — {_find_phrase}"
+                if recent := _recent_skill_hint(category):
+                    line += f"; recently used: {', '.join(recent)}"
+                index_lines.append(line)
+            else:
+                index_lines.append(f"  {category} [names only]: {', '.join(sorted({n for n, _ in entries}))}")
             continue
         cat_desc = category_descriptions.get(category, "")
         index_lines.append(f"  {category}: {cat_desc}" if cat_desc else f"  {category}:")

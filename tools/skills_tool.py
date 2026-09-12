@@ -637,6 +637,246 @@ registry.register(
     check_fn=check_skills_requirements, emoji="📚")
 
 
+# ---------------------------------------------------------------------------------------------
+# skill_search — local semantic lookup over the installed skill catalog.
+#
+# Why it exists: the always-on skills index (agent/prompt_builder.py) keeps hot skills named but
+# renders demoted categories as "[count only]: N skills", because the names of ~400 skills are the
+# residual fixed prompt cost.  That trade is only safe when there is a cheap way back to the names.
+# Retrieval runs on a LOCAL embedding model (Ollama, default bge-m3:latest) over a prebuilt vector
+# index, so a lookup costs no API tokens and never leaves the machine; when no embedder is reachable
+# it degrades to a lexical pass over the same catalog instead of failing.  Read-only: nothing here
+# writes to the skills tree (only the index cache under $HERMES_HOME/cache/).
+_SKILL_SEARCH_INDEX_PATH = ("cache", "skill_search_index.npz")
+_SKILL_SEARCH_DEFAULT_MODEL = os.getenv("HERMES_SKILL_SEARCH_MODEL", "bge-m3:latest")
+_SKILL_SEARCH_DEFAULT_URL = os.getenv("HERMES_SKILL_SEARCH_URL", "http://localhost:11434")
+_SKILL_SEARCH_BATCH = 32
+_SKILL_SEARCH_DESC_CHARS = 220
+_SKILL_SEARCH_CACHE: dict = {}      # {"signature", "names", "cats", "descs", "vectors"|None}
+
+
+def _skill_search_index_file() -> Path:
+    return get_hermes_home().joinpath(*_SKILL_SEARCH_INDEX_PATH)
+
+
+def _skill_search_catalog() -> List[Dict[str, Any]]:
+    """Visible skills (name/category/description) — the same filter skills_list applies."""
+    return _sort_skills(_find_all_skills())
+
+
+def _skill_search_signature(skills: List[Dict[str, Any]]) -> str:
+    import hashlib
+    blob = "\n".join(f"{s['name']}|{s.get('category') or ''}|{(s.get('description') or '')[:120]}" for s in skills)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _skill_search_embed(texts: List[str], model: str, url: str) -> Optional[List[List[float]]]:
+    """Embed locally via Ollama. Returns None when unavailable — callers fall back to lexical."""
+    import urllib.error
+    import urllib.request
+    payload = json.dumps({"model": model, "input": texts}).encode("utf-8")
+    for path, body in (("/api/embed", payload),
+                       ("/api/embeddings", json.dumps({"model": model, "prompt": texts[0]}).encode("utf-8"))):
+        try:
+            req = urllib.request.Request(url.rstrip("/") + path, data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read())
+            if "embeddings" in data and data["embeddings"]:
+                return data["embeddings"]
+            if "embedding" in data and data["embedding"]:
+                return [data["embedding"]] * len(texts)
+        except urllib.error.HTTPError:
+            continue          # older/different endpoint shape — try the next form
+        except Exception as e:
+            logger.debug("skill_search embedder unavailable (%s): %s", path, e)
+            return None
+    return None
+
+
+def _skill_search_build(skills: List[Dict[str, Any]], model: str, url: str) -> Optional[dict]:
+    """Embed the catalog and persist the index. None when the embedder is unreachable."""
+    import numpy as np
+    docs = [f"{s['name']} — {(s.get('description') or '').strip()}"[:_SKILL_SEARCH_DESC_CHARS * 2] for s in skills]
+    vectors: List[List[float]] = []
+    for i in range(0, len(docs), _SKILL_SEARCH_BATCH):
+        out = _skill_search_embed(docs[i:i + _SKILL_SEARCH_BATCH], model, url)
+        if out is None:
+            return None
+        vectors.extend(out)
+    if len(vectors) != len(docs):
+        return None
+    mat = np.asarray(vectors, dtype="float32")
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    mat = mat / np.where(norms == 0, 1.0, norms)      # pre-normalised → cosine is a dot product
+    index = {
+        "signature": _skill_search_signature(skills),
+        "model": model,
+        "names": [s["name"] for s in skills],
+        "cats": [s.get("category") or "" for s in skills],
+        "descs": [_truncate_description(s.get("description") or "") for s in skills],
+        "vectors": mat,
+    }
+    try:
+        path = _skill_search_index_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as fh:            # file object: numpy would append .npz to a bare path
+            np.savez_compressed(fh, **{k: v for k, v in index.items() if k != "vectors"},
+                                vectors=index["vectors"])
+        tmp.replace(path)
+        logger.info("skill_search index built: %d skills, model=%s", len(skills), model)
+    except Exception as e:      # a failed cache write must not cost the caller its results
+        logger.debug("skill_search index not persisted: %s", e)
+    return index
+
+
+def _skill_search_load(skills: List[Dict[str, Any]], model: str) -> Optional[dict]:
+    """Cached index for the FULL catalog + model, rebuilt when the catalog changes.
+
+    Always called with the complete catalog: one index serves every query, and a category filter is
+    applied to the scores afterwards.  Building from a filtered list would persist a partial index.
+    """
+    signature = _skill_search_signature(skills)
+    if (_SKILL_SEARCH_CACHE.get("signature") == signature
+            and _SKILL_SEARCH_CACHE.get("model") == model
+            and _SKILL_SEARCH_CACHE.get("vectors") is not None):
+        return _SKILL_SEARCH_CACHE
+    import numpy as np
+    try:
+        path = _skill_search_index_file()
+        if path.exists():
+            with np.load(path, allow_pickle=False) as z:
+                if str(z["signature"]) == signature and str(z["model"]) == model:
+                    _SKILL_SEARCH_CACHE.clear()
+                    _SKILL_SEARCH_CACHE.update({
+                        "signature": signature, "model": model,
+                        "names": [str(x) for x in z["names"]],
+                        "cats": [str(x) for x in z["cats"]],
+                        "descs": [str(x) for x in z["descs"]],
+                        "vectors": z["vectors"],
+                    })
+                    return _SKILL_SEARCH_CACHE
+    except Exception as e:
+        logger.debug("skill_search index unreadable, rebuilding: %s", e)
+    built = _skill_search_build(skills, model, _SKILL_SEARCH_DEFAULT_URL)
+    if built is None:
+        return None
+    _SKILL_SEARCH_CACHE.clear()
+    _SKILL_SEARCH_CACHE.update(built)
+    return _SKILL_SEARCH_CACHE
+
+
+def _skill_search_cat_match(cat: str, want: str) -> bool:
+    """Category filter semantics: exact, or a nested subcategory of the wanted one."""
+    cat = str(cat or "").lower()
+    return cat == want or cat.startswith(want + "/")
+
+
+def _skill_search_lexical(query: str, skills: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
+    """Character-bigram overlap — the no-embedder path. CJK-safe (no tokenizer needed)."""
+    def grams(text: str) -> set:
+        t = "".join(ch for ch in str(text).lower() if not ch.isspace())
+        return {t[i:i + 2] for i in range(max(0, len(t) - 1))}
+
+    q = grams(query)
+    if not q:
+        return []
+    scored = []
+    for s in skills:
+        doc = grams(f"{s['name']} {s.get('description') or ''}")
+        score = len(q & doc) / (len(q) ** 0.5)
+        if score > 0:      # no overlap at all is not a weak match, it is not a match
+            scored.append((score, s))
+    scored.sort(key=lambda x: -x[0])
+    return [{"name": s["name"], "category": s.get("category") or "",
+             "description": _truncate_description(s.get("description") or ""),
+             "score": round(float(sc), 4)} for sc, s in scored[:k]]
+
+
+def skill_search(query: str, k: int = 5, category: Optional[str] = None,
+                 task_id: Optional[str] = None) -> str:
+    """Return the k best-matching skills for a topic query (local embeddings, no API cost)."""
+    query = str(query or "").strip()
+    if not query:
+        return _json({"error": "query is required"})
+    try:
+        k = max(1, min(int(k or 5), 12))
+    except (TypeError, ValueError):
+        k = 5
+    skills = _skill_search_catalog()
+    cat_want = str(category).strip().lower() if category else ""
+    model = _SKILL_SEARCH_DEFAULT_MODEL
+    index = _skill_search_load(skills, model) if skills else None
+    if index is None:
+        if cat_want:
+            skills = [s for s in skills if _skill_search_cat_match(s.get("category") or "", cat_want)]
+        results = _skill_search_lexical(query, skills, k)
+        return _json({"query": query, "retriever": "lexical-fallback (no local embedder reachable)",
+                      "model": model, "total_skills": len(skills), "results": results,
+                      "note": "Load one with skill_view(name)."})
+    try:
+        import numpy as np
+        qv = _skill_search_embed([f"query: {query}"], index.get("model") or model,
+                                 _SKILL_SEARCH_DEFAULT_URL)
+        if not qv:
+            raise RuntimeError("embedder went away mid-call")
+        q = np.asarray(qv[0], dtype="float32")
+        q = q / (np.linalg.norm(q) or 1.0)
+        scores = index["vectors"] @ q
+        if cat_want:      # filter the scores, not the index: one vector set serves every query
+            scores = np.where([_skill_search_cat_match(c, cat_want) for c in index["cats"]],
+                              scores, np.float32("-inf"))
+        order = [i for i in np.argsort(-scores)[:k] if np.isfinite(scores[i])]
+        results = [{"name": index["names"][i], "category": index["cats"][i],
+                    "description": index["descs"][i], "score": round(float(scores[i]), 4)} for i in order]
+        return _json({"query": query, "retriever": f"{index.get('model') or model} (local)",
+                      "total_skills": len(index["names"]), "results": results,
+                      "note": "Load one with skill_view(name); none of these fit? rephrase, or "
+                              "skills_list(category=...) to enumerate a category."})
+    except Exception as e:
+        logger.debug("skill_search vector pass failed (%s); using lexical", e)
+        results = _skill_search_lexical(query, skills, k)
+        return _json({"query": query, "retriever": "lexical-fallback (vector pass failed)",
+                      "total_skills": len(skills), "results": results,
+                      "note": "Load one with skill_view(name)."})
+
+
+SKILL_SEARCH_SCHEMA = {
+    "name": "skill_search",
+    "description": (
+        "Find skills by topic with local embeddings (offline, no API cost). Use it when the skills "
+        "index shows a category as '[count only]: N skills' and the task may match one of them, or "
+        "whenever you are unsure which skill covers a topic. Returns the closest skill names with "
+        "category and one-line description; load the chosen one with skill_view(name)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What you need a skill for, in words (Chinese or English).",
+            },
+            "k": {
+                "type": "integer",
+                "description": "How many matches to return (default 5, max 12).",
+            },
+            "category": {
+                "type": "string",
+                "description": "Optional category filter (e.g. 'devops') to search inside one bucket.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+registry.register(
+    name="skill_search", toolset="skills", schema=SKILL_SEARCH_SCHEMA,
+    handler=lambda args, **kw: skill_search(query=args.get("query"), k=args.get("k", 5),
+                                            category=args.get("category"), task_id=kw.get("task_id")),
+    check_fn=check_skills_requirements, emoji="🔎")
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count/use on success (best-effort). Repeat-view dedup
     mirrors read_file's unchanged-stub: a SAME, unchanged skill file already loaded in this
